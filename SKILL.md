@@ -11,6 +11,20 @@ description: Use when a research data-analysis case supplies grouped measurement
 
 不适用：实验设计、样本量估算、生存分析、混合模型、多重插补。脚本不做因果推断，也不把 p 值转述为「证明有效」。
 
+## Quickstart
+
+包内自带一个合成演示案例，可直接跑通：
+
+```powershell
+python scripts/run_skill.py --case examples/demo-case/case.json --out "$env:TEMP\demo_c0e1e220\result.json" --work "$env:TEMP\demo_c0e1e220\work"
+```
+
+- 演示输入：`examples/demo-case/case.json` + `examples/demo-case/input/dose_response.csv`（3 组 × 4 个重复，组间差异明显）。
+- 输出：`$env:TEMP\demo_c0e1e220\result.json`，单因素方差分析 F=57.76、p≈7.34e-06；`descriptive` 给出每组 n/均值/SD/中位数/四分位，`interpretation` 明确写出「显著不等于因果关系」。
+- `output_contract` 的 `descriptive`、`tests`、`effect_sizes`、`interpretation` 四个键均非空；同一输入连续两次运行的 result.json 字节一致。
+
+> 数据为合成样本，不代表任何真实实验或官方评测数据。
+
 ## 输入
 
 - `case.json`：`case_id`、`output_contract`；可选 `group_column`、`value_column`、`alpha`、`paired`。
