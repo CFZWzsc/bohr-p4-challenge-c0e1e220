@@ -1,0 +1,13 @@
+{
+  "case_id": "demo-stats-guard-01",
+  "output_contract": {
+    "descriptive": "array",
+    "tests": "object",
+    "effect_sizes": "object",
+    "interpretation": "string"
+  },
+  "input_dir": "input",
+  "group_column": "dose_group",
+  "value_column": "score",
+  "alpha": 0.05
+}
