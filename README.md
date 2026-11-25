@@ -15,6 +15,7 @@ answers, private data or credentials are included.
 
 | File |
 |------|
+| `RUBRIC.md` |
 | `SKILL.md` |
 | `examples/demo-case/case.json` |
 | `examples/demo-case/input/dose_response.csv` |
