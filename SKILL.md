@@ -19,8 +19,8 @@ description: Use when a research data-analysis case supplies grouped measurement
 python scripts/run_skill.py --case examples/demo-case/case.json --out "$env:TEMP\demo_c0e1e220\result.json" --work "$env:TEMP\demo_c0e1e220\work"
 ```
 
-- 演示输入：`examples/demo-case/case.json` + `examples/demo-case/input/dose_response.csv`（3 组 × 4 个重复，组间差异明显）。
-- 输出：`$env:TEMP\demo_c0e1e220\result.json`，单因素方差分析 F=57.76、p≈7.34e-06；`descriptive` 给出每组 n/均值/SD/中位数/四分位，`interpretation` 明确写出「显著不等于因果关系」。
+- 演示输入：`examples/demo-case/case.json` + `examples/demo-case/input/dose_response.csv`（3 组；`high_dose` 仅 1 个观测，`low_dose` 含 1 条完全重复行，用于演示降级与去重告警）。
+- 输出：`$env:TEMP\demo_c0e1e220\result.json`；因一组 n<3 不运行推断检验，`tests.method="none"` 并写明原因，`assumptions.variance.method="not_applicable"`；`descriptive` 给出每组 n/均值/SD/中位数/四分位，`confidence_intervals.group_mean_ci95` 给出可估组的均值区间，`interpretation` 说明为何未检验及「显著不等于因果关系」，`status="partial"`。
 - `output_contract` 的 `descriptive`、`tests`、`effect_sizes`、`interpretation` 四个键均非空；同一输入连续两次运行的 result.json 字节一致。
 
 > 数据为合成样本，不代表任何真实实验或官方评测数据。
@@ -28,25 +28,25 @@ python scripts/run_skill.py --case examples/demo-case/case.json --out "$env:TEMP
 ## 输入
 
 - `case.json`：`case_id`、`output_contract`；可选 `group_column`、`value_column`、`alpha`、`paired`。
-- 未指定列时自动推断：第一列 2–10 个取值的分类列作分组，第一列可解析数值作测量值，并在 `evidence` 记录推断依据。
+- 未指定列时自动推断：优先取 2–10 个取值的分类列作分组、可解析数值列作测量值；表头中没有分类列而只有单一数值列时按单序列描述，并在 `evidence` 记录推断依据。
 - 输出：`/app/output/result.json`。
 
 ## 处理流程（对应评分维度）
 
-1. **数据准备（任务完成度）**：读取表头、编码与分隔符；缺失值不入组、不填补，记录剔除行数与比例；完全重复行单独计数并保留。
+1. **数据准备（任务完成度）**：读取表头、编码与分隔符；缺失值不入组、不填补，记录剔除行数与比例；`case.json` 给出且存在于表头的 `key_columns` 按键去重（保留首次出现，记录 `cleaning.rows_removed` 与 `dedup_rule`），否则完全重复行计数保留并在 `cleaning` 告警「duplicate observations inflate n」。
 2. **描述统计（正确性）**：每组给出 n、均值、样本标准差、中位数、Q1/Q3、最小/最大；口径与单位来源写入 `evidence`。
-3. **假设检查（规范性）**：用偏度与样本量做分布提示（明确标注为启发式，非 Shapiro-Wilk）；用 Brown-Forsythe 检验方差齐性；假设不满足时降级并写入 `assumptions.verdict`。
+3. **假设检查（规范性）**：用偏度与样本量做分布提示（明确标注为启发式，非 Shapiro-Wilk）；仅当组数 ≥2 且每组 n≥2 时用 Brown-Forsythe 检验方差齐性，否则 `assumptions.variance.method="not_applicable"` 并给原因；假设不满足时降级并在 `interpretation` 说明。
 4. **推断统计（正确性）**：两组用 Welch t 检验（不假设方差齐性）；多组用单因素方差分析；样本量不足、组内方差为零、组数不足时**不给 p 值**，只给描述统计。
-5. **效应量与区间（完整性）**：两组给 Cohen's d 与 Hedges g；多组给 eta²；组均值差给 95% 置信区间（t 临界值由不完全 beta 函数数值求解），区间与检验口径一致。
-6. **结果解释（可读性）**：区分统计显著与实际意义，标注 α、单/双侧、样本量限制、多重比较未校正等，不写因果结论。
-7. **可复跑（可核验性）**：输出输入哈希、方法选择规则、公式版本；无随机过程。
+5. **效应量与区间（完整性）**：两组给 Cohen's d 与 Hedges g；多组给 eta²；每组 n≥2 时给均值 95% 置信区间（t 临界值由不完全 beta 函数数值求解），区间与检验口径一致；确实不可估时写 `not_estimable` 及原因，不留空对象。
+6. **结果解释（可读性）**：每条分支（含无数据、列无法解析、n<3、零方差）都写出比较对象、各组 n、描述差异、检验取舍原因与限制；区分统计显著与实际意义，标注 α、单/双侧、样本量限制、多重比较未校正等，不写因果结论。
+7. **可复跑（可核验性）**：输出输入哈希、方法选择规则、公式版本；无随机过程与时间戳。
 
 ## 输出契约
 
 | 字段 | 含义 |
 |-|-|
 | `case_id` | 与输入一致 |
-| `output_contract` 各字段 | 命中别名时填真实值，否则 `null` + `contract_notes` |
+| `output_contract` 各字段 | 按名称/关键词映射到 `descriptive`/`tests`/`effect_sizes`/`confidence_intervals`/`interpretation`/`cleaning`；无法映射时保留 `null` 并在 `contract_extras` 给最佳努力值与原因 |
 | `status` | `success` / `partial` / `insufficient_input` / `failed` |
 | `result` | `descriptive`、`assumptions`、`tests`、`effect_sizes`、`confidence_intervals`、`interpretation` |
 | `evidence` | 数据文件哈希、列映射、方法规则、α |
@@ -57,11 +57,11 @@ python scripts/run_skill.py --case examples/demo-case/case.json --out "$env:TEMP
 
 | 情况 | 处置 | 状态 |
 |-|-|-|
-| case.json 缺失/非法 | 空结果 + 错误 | `failed` |
-| 无数据文件 | 空结果并说明 | `insufficient_input` |
+| case.json 缺失/非法 | 结构化失败结果 + 错误说明 | `failed` |
+| 无数据文件 | 各产出字段显式 `not_estimable` 并说明 | `insufficient_input` |
 | 找不到分组/数值列 | 只做单变量描述并说明 | `partial` |
 | 组数 < 2 | 不检验，仅描述 | `partial` |
-| 任一组 n < 3 | 不检验，给描述与说明 | `partial` |
+| 任一组 n < 3（含 n < 2） | 不检验，给描述与说明；n < 2 时方差齐性标 `not_applicable` | `partial` |
 | 组内方差为零 | 不计算 t/F，标注退化 | `partial` |
 | 缺失比例 > 50% | 报告并标注结果不稳 | `partial` |
 | 方差齐性不成立 | 两组仍用 Welch；多组标注未做 Welch ANOVA | `partial` |
