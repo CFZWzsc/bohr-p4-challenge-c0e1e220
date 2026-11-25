@@ -753,6 +753,33 @@ def main(argv=None):
                             effect_sizes = {"eta_squared": an["eta_squared"],
                                             "magnitude": eta_magnitude(an["eta_squared"]),
                                             "contrast": "all %d groups (between vs within variance)" % k}
+                    if k >= 2 and test_reason is None:
+                        tests["n_rows"] = sum(len(groups_map[n]) for n in names)
+                        tests["group_n"] = {str(n): len(groups_map[n]) for n in names}
+                    if k >= 3 and test_reason is None and tests.get("test_run"):
+                        pairs = []
+                        for i in range(k):
+                            for j in range(i + 1, k):
+                                a1, a2 = groups_map[names[i]], groups_map[names[j]]
+                                if len(a1) < 2 or len(a2) < 2:
+                                    continue
+                                wr = welch(a1, a2)
+                                if wr is None:
+                                    continue
+                                pairs.append({"contrast": "%s minus %s" % (names[i], names[j]),
+                                              "mean_difference": wr["mean_diff"],
+                                              "p_value": wr["p"]})
+                        pairs.sort(key=lambda d: (d["p_value"], d["contrast"]))
+                        prev = 0.0
+                        for rank, item in enumerate(pairs):
+                            adj = min(1.0, (len(pairs) - rank) * item["p_value"])
+                            prev = max(prev, adj)
+                            item["p_holm"] = prev
+                            item["significant_holm"] = bool(prev < alpha)
+                        tests["posthoc"] = {"method": "pairwise Welch t-tests, Holm-adjusted",
+                                            "family_size": len(pairs), "alpha": alpha,
+                                            "comparisons": pairs,
+                                            "note": "exploratory post-hoc; the omnibus test remains primary"}
                     if not effect_sizes:
                         reason = "no effect size is estimable: %s" % (test_reason or "no contrast is defined")
                         effect_sizes = ({"eta_squared": None, "reason": reason} if k > 2
@@ -820,10 +847,19 @@ def main(argv=None):
                     if cleaning.get("dropped_missing"):
                         parts.append("Excluded %d row(s) with missing or non-numeric values (no imputation)."
                                      % cleaning["dropped_missing"])
+                    posthoc = tests.get("posthoc")
+                    if posthoc and posthoc.get("comparisons"):
+                        sig_pairs = [c["contrast"] for c in posthoc["comparisons"] if c.get("significant_holm")]
+                        parts.append("Holm-adjusted pairwise Welch comparisons (%d pair(s), family alpha=%s): %s."
+                                     % (posthoc["family_size"], sig(alpha),
+                                        ("significant for " + "; ".join(sig_pairs)) if sig_pairs
+                                        else "none remain significant after adjustment"))
+                    multi = ("pairwise post-hoc p values are Holm-adjusted (exploratory); the omnibus ANOVA p "
+                             "value is unadjusted" if posthoc else
+                             "p values are unadjusted for multiple comparisons")
                     parts.append("Limitations: normality is only a skewness heuristic (not Shapiro-Wilk); "
-                                 "p values are unadjusted for multiple comparisons; observations are assumed "
-                                 "independent; statistical significance does not prove a causal or practically "
-                                 "important effect.")
+                                 + multi + "; observations are assumed independent; statistical significance "
+                                 "does not prove a causal or practically important effect.")
                     interpretation = " ".join(parts)
 
                     degraded = bool(p is None or k < 2 or min_n < 3
