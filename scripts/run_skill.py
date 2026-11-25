@@ -316,12 +316,130 @@ def brown_forsythe(groups):
     return one_way(z)
 
 
-def resolve_field(field, payload):
+def sig(x, digits=4):
+    if x is None:
+        return "n/a"
+    try:
+        if isinstance(x, float) and (math.isnan(x) or math.isinf(x)):
+            return "n/a"
+    except (TypeError, ValueError):
+        return "n/a"
+    return "%.*g" % (digits, x)
+
+
+def group_mean_ci(d, conf=0.95):
+    if d.get("n", 0) < 2 or d.get("sd") is None:
+        return None
+    half = t_crit(d["n"] - 1, conf) * d["sd"] / math.sqrt(d["n"])
+    return [d["mean"] - half, d["mean"] + half]
+
+
+def magnitude_label(d):
+    if d is None:
+        return None
+    a = abs(d)
+    return "small" if a < 0.5 else "medium" if a < 0.8 else "large"
+
+
+def eta_magnitude(eta):
+    if eta is None:
+        return None
+    return "small" if eta < 0.06 else "medium" if eta < 0.14 else "large"
+
+
+def two_group_effect(a, b):
+    n1, n2 = len(a), len(b)
+    if n1 < 2 or n2 < 2:
+        return {"d": None, "g": None, "reason": "a group has n<2, so a pooled SD is undefined"}
+    v1, v2 = var(a), var(b)
+    pooled = math.sqrt(((n1 - 1) * v1 + (n2 - 1) * v2) / (n1 + n2 - 2))
+    if pooled <= 0:
+        return {"d": None, "g": None, "reason": "pooled SD is zero, so Cohen's d and Hedges' g are undefined"}
+    d = (mean(a) - mean(b)) / pooled
+    return {"d": d, "g": d * (1.0 - 3.0 / (4 * (n1 + n2) - 9))}
+
+
+def prepare_rows(rows, header, case):
+    """Deduplicate before statistics; never drop exact duplicates without key columns."""
+    cleaning = {"rows_read": len(rows), "dropped_missing": 0, "duplicate_rows": 0,
+                "rows_removed": 0, "dedup_rule": "none"}
+    key_cols = case.get("key_columns")
+    key_idx, key_names = [], []
+    if isinstance(key_cols, list):
+        for name in key_cols:
+            if isinstance(name, str) and name in header:
+                key_idx.append(header.index(name))
+                key_names.append(name)
+    if key_idx:
+        seen, kept = set(), []
+        for r in rows:
+            key = tuple(r[i].strip() for i in key_idx)
+            if key in seen:
+                cleaning["rows_removed"] += 1
+                continue
+            seen.add(key)
+            kept.append(r)
+        cleaning["dedup_rule"] = "key_columns:first_occurrence"
+        cleaning["key_columns"] = key_names
+        rows = kept
+    else:
+        if isinstance(key_cols, list) and key_cols:
+            cleaning["dedup_rule"] = "none:key_columns_not_found"
+            cleaning["warnings"] = ["declared key_columns not present in header; no deduplication applied"]
+        seen, dup = set(), 0
+        for r in rows:
+            key = tuple(c.strip() for c in r)
+            if key in seen:
+                dup += 1
+            else:
+                seen.add(key)
+        if dup:
+            cleaning["duplicate_rows"] = dup
+            cleaning["duplicate_check"] = {"duplicate_rows": dup, "action": "kept",
+                                           "warning": "duplicate observations inflate n"}
+            cleaning.setdefault("warnings", []).append("duplicate observations inflate n")
+            if cleaning["dedup_rule"] == "none":
+                cleaning["dedup_rule"] = "none:exact_duplicates_kept"
+    return rows, cleaning
+
+
+def keyword_family(field):
+    k = norm_key(field)
+    if k.startswith("stats") or k.startswith("descriptive") or k.startswith("desc_") or k.endswith("_stats"):
+        return "descriptive"
+    if k.startswith("test") or k.startswith("infer") or k.startswith("p_value") or k.startswith("pval"):
+        return "tests"
+    if k.startswith("effect"):
+        return "effect_sizes"
+    if k.startswith("conf") or k.startswith("interval") or k == "ci" or k.startswith("ci_") or k.endswith("_ci"):
+        return "confidence_intervals"
+    if k.startswith("interpret") or k.startswith("conclusion") or k.startswith("answer") or k.startswith("summary"):
+        return "interpretation"
+    if k.startswith("clean"):
+        return "cleaning"
+    return None
+
+
+def resolve_contract(field, payload):
+    canon = keyword_family(field)
+    if canon is not None and canon in payload:
+        return canon, payload[canon]
     key = norm_key(field)
     for canonical, names in ALIASES.items():
         if key == canonical or key in names:
             return canonical, payload.get(canonical)
     return None, None
+
+
+def best_effort_value(field, payload):
+    k = norm_key(field)
+    if any(w in k for w in ("limit", "risk", "caveat", "uncertainty")):
+        return payload.get("uncertainty") or payload.get("interpretation")
+    if "method" in k or "formula" in k:
+        return payload.get("evidence", {}).get("methods") or payload.get("interpretation")
+    if any(w in k for w in ("file", "source", "hash", "data")):
+        return payload.get("evidence", {}).get("source") or payload.get("interpretation")
+    return payload.get("interpretation") or payload.get("summary")
 
 
 def main(argv=None):
@@ -334,14 +452,27 @@ def main(argv=None):
 
     case_path = Path(args.case)
     errors, skipped, case, status = [], [], {}, "success"
+    interpretation = ""
     try:
         with open(case_path, "r", encoding="utf-8-sig") as fh:
             case = json.load(fh)
         if not isinstance(case, dict):
             raise ValueError("case.json root is not an object")
-    except (OSError, ValueError) as exc:
-        errors.append("cannot read case.json: %s" % exc)
+    except OSError as exc:
+        errors.append("cannot read case.json: %s" % (exc.strerror or "I/O error"))
         case, status = {}, "failed"
+        interpretation = (
+            "case.json could not be opened (%s), so no data were read and no descriptive statistic, test, "
+            "effect size or confidence interval was computed. Limitations: nothing is estimable until a "
+            "readable case.json with output_contract and an input data file is supplied."
+            % (exc.strerror or type(exc).__name__))
+    except ValueError as exc:
+        errors.append("cannot read case.json: invalid JSON (%s)" % exc)
+        case, status = {}, "failed"
+        interpretation = (
+            "case.json is not valid JSON (%s), so no data were read and no descriptive statistic, test, "
+            "effect size or confidence interval was computed. Limitations: fix the case file and rerun; "
+            "nothing is estimable from a malformed contract." % exc)
 
     case_id = case.get("case_id") if isinstance(case.get("case_id"), str) else "unknown"
     fields = contract_fields(case)
@@ -376,60 +507,130 @@ def main(argv=None):
                       "delimiter": "tab" if delim == "\t" else delim}
             break
 
-    descriptive, assumptions, tests, effect_sizes, intervals = [], {}, {}, {}, {}
-    cleaning = {"rows_read": len(rows), "dropped_missing": 0, "duplicate_rows": 0}
-    interpretation = ""
+    descriptive = []
+    assumptions = {"normality": {"method": "skewness heuristic (not Shapiro-Wilk)", "per_group": []},
+                   "variance": {"method": "not_applicable", "reason": "no input data"},
+                   "sample_size_ok": False}
+    tests = {"method": "none", "test_run": False, "p_value": None, "reason": "no input data"}
+    effect_sizes = {"status": "not_estimable", "reason": "no data were available"}
+    intervals = {"status": "not_estimable", "reason": "no data were available"}
+    cleaning = {"rows_read": len(rows), "dropped_missing": 0, "duplicate_rows": 0,
+                "rows_removed": 0, "dedup_rule": "none"}
     groups_map = {}
 
     if status != "failed":
         if not rows:
             status = "insufficient_input"
+            interpretation = (
+                "No data rows were found in the declared input locations (header %s), so no descriptive "
+                "statistic, test, effect size or confidence interval is estimable. Supply a CSV/TSV table "
+                "with one row per observation plus a group column and a numeric value column; the status "
+                "stays insufficient_input until then."
+                % ("was parsed" if header else "was not found"))
         else:
-            if not group_col or group_col not in header:
+            rows, cleaning = prepare_rows(rows, header, case)
+            cleaning["rows_analyzed"] = len(rows)
+
+            group_ok = bool(group_col) and group_col in header
+            group_note = None
+            if not group_ok:
+                group_note = ("declared group_column %s is absent from the header (%s)"
+                              % (group_col, ", ".join(header))) if group_col else \
+                             "case.json declared no group_column"
                 candidates = []
                 for name in header:
                     vals = {r[header.index(name)].strip() for r in rows}
                     if 2 <= len(vals) <= 10:
                         candidates.append(name)
                 group_col = candidates[0] if candidates else None
-            if not value_col or value_col not in header:
+                group_ok = bool(group_col) and group_col in header
+
+            value_ok = bool(value_col) and value_col in header
+            value_note = None
+            if not value_ok:
+                value_note = ("declared value_column %s is absent from the header" % value_col) if value_col else \
+                             "case.json declared no value_column"
                 for name in header:
                     if name == group_col:
                         continue
                     idx = header.index(name)
-                    vals = [to_float(r[idx]) for r in rows if r[idx].strip().lower() not in MISSING]
+                    vals = [v for v in (to_float(r[idx]) for r in rows
+                                        if r[idx].strip().lower() not in MISSING) if v is not None]
                     if vals and len(vals) / float(max(1, len(rows))) >= 0.8:
                         value_col = name
                         break
-            if not group_col or not value_col:
-                numeric = []
-                idx = header.index(value_col) if value_col in header else 0
+                value_ok = bool(value_col) and value_col in header
+
+            if group_ok and not value_ok:
+                gi_try = header.index(group_col)
+                ratio = sum(1 for r in rows if to_float(r[gi_try]) is not None) / float(max(1, len(rows)))
+                if ratio >= 0.8:
+                    value_col, value_ok = group_col, True
+                    group_col, group_ok = None, False
+                    group_note = ("no column had 2-10 categorical values for grouping, so %s was described "
+                                  "as a single numeric series" % value_col)
+
+            if not group_ok or not value_ok:
+                idx = header.index(value_col) if value_ok else 0
                 vals = [to_float(r[idx]) for r in rows if to_float(r[idx]) is not None]
                 if vals:
                     descriptive = [{"group": "all", "n": len(vals), "mean": mean(vals),
-                                    "sd": math.sqrt(var(vals)), "median": median(vals),
-                                    "q1": quantile(vals, 0.25), "q3": quantile(vals, 0.75),
-                                    "min": min(vals), "max": max(vals)}]
+                                    "sd": math.sqrt(var(vals)) if len(vals) > 1 else None,
+                                    "median": median(vals), "q1": quantile(vals, 0.25),
+                                    "q3": quantile(vals, 0.75), "min": min(vals), "max": max(vals),
+                                    "skewness": skew(vals)}]
                     groups_map = {"all": vals}
+                missing_bits = []
+                if not group_ok:
+                    missing_bits.append(group_note or "the group column could not be resolved")
+                if not value_ok:
+                    missing_bits.append(value_note or "the value column could not be resolved")
+                if vals:
+                    half = (t_crit(len(vals) - 1) * math.sqrt(var(vals)) / math.sqrt(len(vals))
+                            if len(vals) > 1 else None)
+                    intervals = {"group_mean_ci95": [{"group": "all", "n": len(vals), "mean": mean(vals),
+                                                      "ci95": [mean(vals) - half, mean(vals) + half],
+                                                      "method": "two-sided t interval, sample SD"}],
+                                 "note": "single pooled series only; no group contrast exists"}
+                    interpretation = (
+                        "No between-group comparison was run because %s. A single-series summary is reported "
+                        "instead: n=%d, mean=%s, SD=%s, median=%s, min=%s, max=%s. "
+                        "Effect sizes need a group contrast, so none is estimable. Limitations: without a valid "
+                        "grouping factor no test, effect size or group-difference interval is defined, and this "
+                        "summary mixes every row into one series."
+                        % ("; ".join(missing_bits), len(vals), sig(mean(vals)),
+                           sig(math.sqrt(var(vals)) if len(vals) > 1 else None), sig(median(vals)),
+                           sig(min(vals)), sig(max(vals))))
+                else:
+                    intervals = {"status": "not_estimable",
+                                 "reason": "no numeric observations in the inspected column"}
+                    interpretation = (
+                        "No analysis was run because %s, and no numeric value could be parsed. Limitations: "
+                        "descriptive statistics, tests, effect sizes and intervals all require a numeric value "
+                        "column and a categorical group column, so nothing is estimable yet."
+                        % "; ".join(missing_bits))
+                assumptions = {"normality": {"method": "skewness heuristic (not Shapiro-Wilk)",
+                                             "per_group": [{"group": str(d["group"]),
+                                                            "skewness": d["skewness"], "n": d["n"],
+                                                            "flag": False} for d in descriptive]},
+                               "variance": {"method": "not_applicable",
+                                            "reason": "no valid group/value column pair"},
+                               "sample_size_ok": False}
+                effect_sizes = {"status": "not_estimable",
+                                "reason": "no group contrast exists without a resolved group column"}
+                tests = {"method": "none", "test_run": False, "p_value": None,
+                         "reason": "; ".join(missing_bits)}
                 status = "partial"
-                interpretation = "Group or value column could not be resolved; only a single-series description is reported."
             else:
                 gi, vi = header.index(group_col), header.index(value_col)
-                seen_rows, dedup = set(), 0
                 for r in rows:
-                    key = tuple(c.strip() for c in r)
-                    if key in seen_rows:
-                        dedup += 1
-                    else:
-                        seen_rows.add(key)
                     g = r[gi].strip() or "missing_group"
                     v = to_float(r[vi])
                     if r[vi].strip().lower() in MISSING or v is None:
                         cleaning["dropped_missing"] += 1
                         continue
                     groups_map.setdefault(g, []).append(v)
-                cleaning["duplicate_rows"] = dedup
-                groups_map = {k: v for k, v in groups_map.items() if v}
+                groups_map = {name: vals for name, vals in groups_map.items() if vals}
                 for name in sorted(groups_map):
                     vals = groups_map[name]
                     descriptive.append({"group": name, "n": len(vals), "mean": mean(vals),
@@ -438,85 +639,202 @@ def main(argv=None):
                                         "q3": quantile(vals, 0.75), "min": min(vals), "max": max(vals),
                                         "skewness": skew(vals)})
                 k = len(groups_map)
-                min_n = min(len(v) for v in groups_map.values()) if groups_map else 0
-                bf = brown_forsythe(list(groups_map.values()))
-                assumptions = {
-                    "normality": {
-                        "method": "skewness heuristic (not Shapiro-Wilk)",
-                        "per_group": [{"group": str(d["group"]), "skewness": d["skewness"],
-                                       "n": d["n"],
-                                       "flag": bool(d["skewness"] is not None and abs(d["skewness"]) > 1 and d["n"] < 30)}
-                                      for d in descriptive],
-                    },
-                    "variance": {"method": "Brown-Forsythe (median-centered Levene)",
-                                 "F": bf["F"] if bf else None, "p": bf["p"] if bf else None,
-                                 "equal_variance_rejected": bool(bf and bf["p"] is not None and bf["p"] < alpha)} if bf else
-                                {"method": "Brown-Forsythe", "note": "not computable"},
-                    "sample_size_ok": min_n >= 3 and k >= 2,
+                n_list = [(name, len(groups_map[name])) for name in sorted(groups_map)]
+                min_n = min([n for _, n in n_list]) if n_list else 0
+                n_txt = ", ".join("%s=%d" % (name, n) for name, n in n_list)
+                normality = {
+                    "method": "skewness heuristic (not Shapiro-Wilk)",
+                    "per_group": [{"group": str(d["group"]), "skewness": d["skewness"], "n": d["n"],
+                                   "flag": bool(d["skewness"] is not None and abs(d["skewness"]) > 1
+                                                and d["n"] < 30)} for d in descriptive],
                 }
-                if k < 2 or min_n < 3:
-                    tests = {"method": "none", "reason": "insufficient groups or group size below 3",
-                             "p_value": None}
+
+                if k == 0:
+                    assumptions = {"normality": normality,
+                                   "variance": {"method": "not_applicable",
+                                                "reason": "no analysable group remains"},
+                                   "sample_size_ok": False}
+                    tests = {"method": "none", "test_run": False, "p_value": None,
+                             "reason": "no numeric observation remained after excluding missing values"}
+                    effect_sizes = {"status": "not_estimable", "reason": "no numeric observations"}
+                    intervals = {"status": "not_estimable", "reason": "no numeric observations"}
+                    interpretation = (
+                        "The group column %s and value column %s resolved, but every value was missing or "
+                        "non-numeric (%d row(s) excluded), so no descriptive, test, effect size or interval is "
+                        "estimable. Limitations: check the value column choice and the missing-value encoding."
+                        % (group_col, value_col, cleaning["dropped_missing"]))
                     status = "partial"
                 else:
-                    alpha_used = alpha
-                    vals_by_group = [groups_map[g] for g in sorted(groups_map)]
-                    if k == 2:
-                        res = welch(vals_by_group[0], vals_by_group[1])
+                    if k >= 2 and min_n >= 2:
+                        bf = brown_forsythe([groups_map[name] for name, _ in n_list])
+                        if bf is None:
+                            variance = {"method": "Brown-Forsythe (median-centered Levene)",
+                                        "reason": "not computable: zero spread of median absolute deviations"}
+                        else:
+                            variance = {"method": "Brown-Forsythe (median-centered Levene)",
+                                        "F": bf["F"], "p": bf["p"],
+                                        "equal_variance_rejected": bool(bf["p"] is not None and bf["p"] < alpha)}
+                    elif k >= 2:
+                        variance = {"method": "not_applicable", "reason": "group with n<2"}
+                    else:
+                        variance = {"method": "not_applicable", "reason": "fewer than 2 groups"}
+                    assumptions = {"normality": normality, "variance": variance,
+                                   "sample_size_ok": bool(k >= 2 and min_n >= 3)}
+
+                    group_ci, no_ci = [], []
+                    for d in descriptive:
+                        ci = group_mean_ci(d)
+                        if ci is None:
+                            no_ci.append(str(d["group"]))
+                        else:
+                            group_ci.append({"group": str(d["group"]), "n": d["n"], "mean": d["mean"],
+                                             "ci95": ci, "method": "two-sided t interval, sample SD"})
+                    if group_ci:
+                        intervals = {"group_mean_ci95": group_ci}
+                        if no_ci:
+                            intervals["groups_without_ci"] = no_ci
+                            intervals["note"] = "groups with n=1 cannot have a mean interval"
+                    else:
+                        intervals = {"status": "not_estimable",
+                                     "reason": "no group has n>=2, so a mean confidence interval is undefined"}
+
+                    effect_sizes = {}
+                    tests = {}
+                    test_reason = None
+                    if k < 2:
+                        test_reason = ("only %d analysable group exists (%s), so no between-group test is defined"
+                                       % (k, n_txt))
+                    elif min_n < 3:
+                        small = ["%s (n=%d)" % (name, n) for name, n in n_list if n < 3]
+                        test_reason = ("group(s) %s have fewer than 3 observations, so no inferential test was run"
+                                       % ", ".join(small))
+                    if test_reason is None and k == 2:
+                        names = [name for name, _ in n_list]
+                        a, b = groups_map[names[0]], groups_map[names[1]]
+                        contrast = "%s minus %s" % (names[0], names[1])
+                        res = welch(a, b)
+                        eff = two_group_effect(a, b)
+                        if eff.get("d") is None:
+                            effect_sizes = {"cohen_d": None, "hedges_g": None,
+                                            "reason": eff.get("reason", "effect size not estimable")}
+                        else:
+                            effect_sizes = {"cohen_d": eff["d"], "hedges_g": eff["g"],
+                                            "magnitude": magnitude_label(eff["d"]),
+                                            "contrast": contrast}
                         if res is None:
-                            tests = {"method": "Welch t-test", "statistic": None,
-                                     "reason": "zero standard error; test not evaluable", "p_value": None}
-                            status = "partial"
+                            tests = {"method": "Welch two-sample t-test", "test_run": False,
+                                     "statistic": None, "p_value": None, "contrast": contrast,
+                                     "reason": "the standard error is zero (both groups have zero variance), "
+                                               "so the t statistic is undefined"}
+                            intervals["mean_difference_ci95"] = None
+                            intervals["mean_difference_ci95_reason"] = "zero standard error"
                         else:
-                            tests = {"method": "Welch two-sample t-test", "statistic": res["t"],
-                                     "df": res["df"], "p_value": res["p"], "alpha": alpha_used,
-                                     "alternative": "two-sided",
-                                     "mean_difference": res["mean_diff"]}
-                            effect_sizes = {"cohen_d": res["cohen_d"], "hedges_g": res["hedges_g"],
-                                            "magnitude": ("small" if abs(res["cohen_d"] or 0) < 0.5 else
-                                                          "medium" if abs(res["cohen_d"] or 0) < 0.8 else "large")}
-                            intervals = {"mean_difference_ci95": res["diff_ci95"],
-                                         "method": "Welch standard error with t critical value"}
-                    else:
-                        an = one_way(vals_by_group)
+                            tests = {"method": "Welch two-sample t-test", "test_run": True,
+                                     "statistic": res["t"], "df": res["df"], "p_value": res["p"],
+                                     "alpha": alpha, "alternative": "two-sided",
+                                     "mean_difference": res["mean_diff"], "contrast": contrast}
+                            intervals["mean_difference_ci95"] = res["diff_ci95"]
+                            intervals["mean_difference_ci95_method"] = "Welch SE with t critical value"
+                    elif test_reason is None:
+                        names = [name for name, _ in n_list]
+                        an = one_way([groups_map[name] for name in names])
                         if an is None:
-                            tests = {"method": "one-way ANOVA", "statistic": None,
-                                     "reason": "within-group variance is zero", "p_value": None}
-                            status = "partial"
+                            tests = {"method": "one-way ANOVA", "test_run": False, "statistic": None,
+                                     "p_value": None, "df1": len(names) - 1,
+                                     "df2": sum(len(groups_map[n]) for n in names) - len(names),
+                                     "reason": "within-group sum of squares is zero, so F is undefined"}
+                            effect_sizes = {"eta_squared": None,
+                                            "reason": "one-way ANOVA is not estimable because "
+                                                      "within-group variance is zero"}
                         else:
-                            tests = {"method": "one-way ANOVA", "statistic": an["F"],
+                            tests = {"method": "one-way ANOVA", "test_run": True, "statistic": an["F"],
                                      "df1": an["df1"], "df2": an["df2"], "p_value": an["p"],
-                                     "alpha": alpha_used, "alternative": "greater"}
+                                     "alpha": alpha, "alternative": "greater"}
                             effect_sizes = {"eta_squared": an["eta_squared"],
-                                            "magnitude": ("small" if an["eta_squared"] < 0.06 else
-                                                          "medium" if an["eta_squared"] < 0.14 else "large")}
-                            intervals = {"note": "ANOVA does not provide a single mean-difference interval",
-                                         "group_mean_ci95": [
-                                             {"group": str(d["group"]),
-                                              "ci95": [d["mean"] - t_crit(max(1, d["n"] - 1)) * (d["sd"] or 0) / math.sqrt(max(1, d["n"])),
-                                                       d["mean"] + t_crit(max(1, d["n"] - 1)) * (d["sd"] or 0) / math.sqrt(max(1, d["n"]))]
-                                              if d["sd"] is not None else None}
-                                             for d in descriptive]}
+                                            "magnitude": eta_magnitude(an["eta_squared"]),
+                                            "contrast": "all %d groups (between vs within variance)" % k}
+                    if not effect_sizes:
+                        reason = "no effect size is estimable: %s" % (test_reason or "no contrast is defined")
+                        effect_sizes = ({"eta_squared": None, "reason": reason} if k > 2
+                                        else {"status": "not_estimable", "reason": reason})
+                    if not tests:
+                        tests = {"method": "none", "test_run": False, "p_value": None,
+                                 "reason": test_reason or "no test was applicable"}
+
+                    desc_txt = "; ".join(
+                        "%s n=%d mean=%s SD=%s median=%s range=%s-%s"
+                        % (str(d["group"]), d["n"], sig(d["mean"]),
+                           "n/a" if d["sd"] is None else sig(d["sd"]), sig(d["median"]),
+                           sig(d["min"]), sig(d["max"])) for d in descriptive)
+                    parts = ["Compared %d group(s) of %s grouped by %s (%s)."
+                             % (k, value_col, group_col, n_txt),
+                             "Descriptives: %s." % desc_txt]
+                    if k >= 2:
+                        ordered = sorted(descriptive, key=lambda d: (d["mean"], str(d["group"])))
+                        low, high = ordered[0], ordered[-1]
+                        parts.append("The largest mean separation is %s (%s) minus %s (%s) = %s."
+                                     % (str(high["group"]), sig(high["mean"]), str(low["group"]),
+                                        sig(low["mean"]), sig(high["mean"] - low["mean"])))
                     p = tests.get("p_value")
-                    sig = (p is not None and p < alpha_used)
-                    interp = ("A Welch two-sample comparison" if k == 2 else "A one-way ANOVA")
-                    if p is None:
-                        interpretation = "Test could not be evaluated; descriptive statistics are reported without a p value."
+                    if p is not None:
+                        df_txt = ("df1=%d, df2=%d" % (tests["df1"], tests["df2"]) if "df1" in tests
+                                  else "df=%s" % sig(tests.get("df")))
+                        parts.append("%s gives statistic=%s (%s) with p=%s at alpha=%s, so the group "
+                                     "difference is %s."
+                                     % (tests["method"], sig(tests.get("statistic")), df_txt, sig(p),
+                                        sig(alpha), "statistically significant" if p < alpha
+                                        else "not statistically significant"))
                     else:
-                        interpretation = ("%s gives p=%.4g at alpha=%.2f; this is %s. "
-                                          "The effect size is %s; statistical significance is not proof of a causal or practically important effect."
-                                          % (interp, p, alpha_used,
-                                             "statistically significant" if sig else "not statistically significant",
-                                             effect_sizes.get("magnitude", "not reported")))
-                        if any(a.get("flag") for a in assumptions["normality"]["per_group"]):
-                            status = "partial"
-                            interpretation += " Some groups are skewed with small n, so a nonparametric check is advisable."
-                        if assumptions["variance"].get("equal_variance_rejected"):
-                            status = "partial"
-                            if k > 2:
-                                interpretation += " Variance homogeneity is rejected; a Welch ANOVA is not implemented here."
-                if cleaning["dropped_missing"] or cleaning["duplicate_rows"]:
-                    status = "partial" if status == "success" else status
+                        parts.append("No p value is reported because %s."
+                                     % tests.get("reason", "the test was not evaluated"))
+                    if effect_sizes.get("cohen_d") is not None:
+                        parts.append("Effect size: Cohen's d=%s and Hedges' g=%s (%s magnitude) for %s."
+                                     % (sig(effect_sizes["cohen_d"]), sig(effect_sizes["hedges_g"]),
+                                        effect_sizes["magnitude"], effect_sizes["contrast"]))
+                    elif effect_sizes.get("eta_squared") is not None:
+                        parts.append("Effect size: eta squared=%s (%s magnitude) over all %d groups."
+                                     % (sig(effect_sizes["eta_squared"]), effect_sizes["magnitude"], k))
+                    else:
+                        parts.append("Effect size: not estimable (%s)."
+                                     % effect_sizes.get("reason", "no contrast is defined"))
+                    if group_ci:
+                        parts.append("95%% confidence intervals for the group means are reported for %s."
+                                     % ", ".join(item["group"] for item in group_ci))
+                        if no_ci:
+                            parts.append("%s cannot have a mean interval because n<2." % ", ".join(no_ci))
+                    if variance.get("method") == "not_applicable":
+                        parts.append("Variance homogeneity was not tested (%s)." % variance["reason"])
+                    elif variance.get("equal_variance_rejected"):
+                        parts.append("Brown-Forsythe rejects equal variances (p=%s); equal-variance "
+                                     "assumptions are avoided, and a Welch ANOVA is not implemented for "
+                                     "more than two groups." % sig(variance.get("p")))
+                    if cleaning.get("rows_removed"):
+                        parts.append("Removed %d later duplicate row(s) using key columns %s, keeping the "
+                                     "first occurrence."
+                                     % (cleaning["rows_removed"],
+                                        ", ".join(cleaning.get("key_columns") or [])))
+                    elif cleaning.get("duplicate_rows"):
+                        parts.append("Kept %d exact duplicate row(s) because no key_columns were supplied; "
+                                     "duplicate observations inflate n and were not removed."
+                                     % cleaning["duplicate_rows"])
+                    if cleaning.get("dropped_missing"):
+                        parts.append("Excluded %d row(s) with missing or non-numeric values (no imputation)."
+                                     % cleaning["dropped_missing"])
+                    parts.append("Limitations: normality is only a skewness heuristic (not Shapiro-Wilk); "
+                                 "p values are unadjusted for multiple comparisons; observations are assumed "
+                                 "independent; statistical significance does not prove a causal or practically "
+                                 "important effect.")
+                    interpretation = " ".join(parts)
+
+                    degraded = bool(p is None or k < 2 or min_n < 3
+                                    or any(item["flag"] for item in normality["per_group"])
+                                    or cleaning.get("dropped_missing") or cleaning.get("rows_removed")
+                                    or cleaning.get("duplicate_rows") or variance.get("equal_variance_rejected"))
+                    status = "partial" if degraded else "success"
+
+    if not interpretation.strip():
+        interpretation = ("No interpretation text was produced for this run; inspect status, tests.reason and "
+                          "errors. This fallback message is a degraded placeholder, not a result.")
 
     evidence = {"source": source, "group_column": group_col, "value_column": value_col,
                 "alpha": alpha, "methods": "Welch t-test for 2 groups, one-way ANOVA for >2 groups",
@@ -534,11 +852,12 @@ def main(argv=None):
               "effect_sizes": effect_sizes, "confidence_intervals": intervals,
               "interpretation": interpretation, "cleaning": cleaning}
     stats = {"groups": len(descriptive), "rows_read": cleaning["rows_read"],
+             "rows_removed": cleaning["rows_removed"],
              "dropped_missing": cleaning["dropped_missing"],
              "duplicate_rows": cleaning["duplicate_rows"],
              "tests_run": 1 if tests.get("p_value") is not None else 0,
              "skipped": len(skipped), "errors": len(errors)}
-    summary = interpretation or "No statistical analysis was produced."
+    summary = interpretation
     payload = {"descriptive": descriptive, "assumptions": assumptions, "tests": tests,
                "effect_sizes": effect_sizes, "confidence_intervals": intervals,
                "interpretation": interpretation, "cleaning": cleaning, "summary": summary,
@@ -549,15 +868,19 @@ def main(argv=None):
               "uncertainty": uncertainty, "errors": errors, "stats": stats,
               "descriptive": descriptive, "assumptions": assumptions, "tests": tests,
               "effect_sizes": effect_sizes, "confidence_intervals": intervals,
-              "interpretation": interpretation}
-    notes = []
+              "interpretation": interpretation, "cleaning": cleaning}
+    notes, extras = [], {}
     for field in fields:
-        canonical, value = resolve_field(field, payload)
+        canonical, value = resolve_contract(field, payload)
         if canonical is None:
             output[field] = None
-            notes.append("%s: no supported producer in this skill; null retained" % field)
+            extras[field] = {"value": best_effort_value(field, payload),
+                             "reason": "no producer matched this field name; best-effort value is returned here"}
+            notes.append("%s: unmapped field kept as null; see contract_extras" % field)
         else:
-            output[field] = value
+            output[field] = None if isinstance(value, str) and not value.strip() else value
+    if extras:
+        output["contract_extras"] = extras
     if notes:
         output["contract_notes"] = notes
 
